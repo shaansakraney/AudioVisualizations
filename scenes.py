@@ -143,6 +143,53 @@ class BarsScene(Scene):
                                 (0, line_y + dy), (int(w * f.rms), line_y + dy))
 
 
+class SpectrumScene(Scene):
+    """Apple-Music-style 6-bin spectrum: bars laid out left-to-right, each
+    growing symmetrically up and down from a horizontal center line as its
+    band (f.bands[i], low -> high frequency) gets louder."""
+
+    name = "spectrum"
+
+    def __init__(self):
+        self.f = None
+        self._scratch = {}
+
+    def update(self, f, dt):
+        self.f = f
+
+    def draw(self, surface):
+        w, h = surface.get_size()
+        s = scale(surface)
+        f = self.f
+        flash = int(30 * (f.beat_strength if f else 0.0))
+        surface.fill((6 + flash, 6 + flash, 10 + flash))
+        if f is None:
+            return
+
+        bands = f.bands
+        n = len(bands)
+        gap = max(6, round(10 * s))
+        corner = max(3, round(4 * s))
+        cy = h // 2
+        max_half = (h - gap * 2) / 2.0
+        bw = (w - gap * (n + 1)) // n
+
+        glow = fx.scratch_surface(self._scratch, "glow", (w, h))
+        rects = []
+        for i, val in enumerate(bands):
+            hue = 0.62 - 0.5 * (i / (n - 1))  # blue (low) -> pink (high)
+            col = hsv(hue, 0.75, 1.0)
+            half = max(2, int(max_half * val))
+            x = gap + i * (bw + gap)
+            rect = (x, cy - half, bw, half * 2)
+            rects.append((rect, col))
+            pygame.draw.rect(glow, (*col, 60), pygame.Rect(rect).inflate(gap, gap),
+                              border_radius=corner * 2)
+        surface.blit(glow, (0, 0))
+        for rect, col in rects:
+            pygame.draw.rect(surface, col, rect, border_radius=corner)
+
+
 class LightningScene(Scene):
     """Branching electric bolts from the center. Beats fire a main strike
     with a couple of forking branches; hot treble occasionally crackles a

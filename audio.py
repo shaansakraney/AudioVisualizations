@@ -63,6 +63,13 @@ class RestingSource:
         treble = 0.5 + 0.40 * np.sin(t * 1.70 + 2.6)
         rms = 0.40 + 0.30 * np.sin(t * 0.50)
         centroid = 0.5 + 0.40 * np.sin(t * 0.23)
+        # 6 incommensurate LFOs, phase-staggered, so the spectrum scene sees
+        # a wandering shape rather than 6 bars breathing in lockstep
+        bands = tuple(
+            float(np.clip(0.5 + 0.42 * np.sin(t * f + p), 0.0, 1.0))
+            for f, p in ((0.55, 0.0), (0.81, 1.1), (1.05, 2.3),
+                         (1.34, 0.4), (1.62, 3.0), (1.93, 1.7))
+        )
 
         beat = False
         if t >= self._next_beat:
@@ -75,7 +82,7 @@ class RestingSource:
         clip = lambda v: float(np.clip(v, 0.0, 1.0))
         return Features(
             rms=clip(rms), bass=clip(bass), mid=clip(mid), treble=clip(treble),
-            centroid=clip(centroid), beat=beat,
+            centroid=clip(centroid), bands=bands, beat=beat,
             beat_strength=self._beat_strength, t=t,
         )
 

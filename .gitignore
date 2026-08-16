@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# Your own audio files -- never want these in git history
+AudioFiles/
+*.wav
+*.mp3
+*.flac
+*.aud

@@ -26,6 +26,7 @@ class Features:
     mid: float = 0.0            # mid band energy, 0..1
     treble: float = 0.0         # high band energy, 0..1
     centroid: float = 0.0       # spectral "brightness", 0..1 (dull -> bright)
+    bands: tuple = (0.0,) * 6   # 6-bin log-spaced spectrum, low -> high freq, 0..1 each
     beat: bool = False          # True only on the frame a beat lands
     beat_strength: float = 0.0  # 1.0 on a beat, decays after -> great for flashes
     t: float = 0.0              # seconds since the source started
@@ -44,6 +45,8 @@ class FeatureExtractor:
     BEAT_SENSITIVITY = 1.4   # bass must exceed running avg * this to count as a beat
     BEAT_FLOOR = 0.15        # ...and be at least this loud (ignores quiet noise)
     BEAT_REFRACTORY = 0.12   # min seconds between beats
+    N_BANDS6 = 6             # bin count for Features.bands
+    BAND6_RANGE_HZ = (20, 16000)  # low..high edge for the 6-bin log spread
     # ------------------------------------------------------------------------
 
     def __init__(self, sample_rate):
@@ -58,6 +61,14 @@ class FeatureExtractor:
             name: (freqs >= lo) & (freqs < hi)
             for name, (lo, hi) in self.BANDS.items()
         }
+
+        lo6, hi6 = self.BAND6_RANGE_HZ
+        edges6 = np.geomspace(lo6, min(hi6, sample_rate / 2 * 0.999), self.N_BANDS6 + 1)
+        self._band6_masks = np.stack([
+            (freqs >= edges6[i]) & (freqs < edges6[i + 1]) for i in range(self.N_BANDS6)
+        ])
+        self._peak6 = np.full(self.N_BANDS6, 1e-5, dtype=np.float32)
+        self._env6 = np.zeros(self.N_BANDS6, dtype=np.float32)
 
         self._env = {"rms": 0.0, "bass": 0.0, "mid": 0.0, "treble": 0.0}
         self._peak = {"rms": 1e-5, "bass": 1e-5, "mid": 1e-5, "treble": 1e-5}
@@ -106,6 +117,15 @@ class FeatureExtractor:
             coeff = self.ATTACK if v > e else self.RELEASE
             self._env[k] = e + coeff * (v - e)
 
+        # 6-bin log-spaced spectrum: same auto-gain + envelope logic as
+        # above, vectorized over the band axis instead of a per-key dict.
+        raw6 = np.array([spec[m].mean() if m.any() else 0.0 for m in self._band6_masks],
+                         dtype=np.float32)
+        self._peak6 = np.maximum(raw6, np.maximum(self._peak6 * self.PEAK_DECAY, 1e-5))
+        norm6 = np.clip(raw6 / (self._peak6 + 1e-9), 0.0, 1.0)
+        coeff6 = np.where(norm6 > self._env6, self.ATTACK, self.RELEASE)
+        self._env6 = self._env6 + coeff6 * (norm6 - self._env6)
+
         # simple energy-based beat detection on the low band
         now = time.time() - self._start
         e_low = norm["bass"]
@@ -123,6 +143,6 @@ class FeatureExtractor:
         return Features(
             rms=self._env["rms"], bass=self._env["bass"],
             mid=self._env["mid"], treble=self._env["treble"],
-            centroid=centroid, beat=beat,
-            beat_strength=self._beat_strength, t=now,
+            centroid=centroid, bands=tuple(float(x) for x in self._env6),
+            beat=beat, beat_strength=self._beat_strength, t=now,
         )
