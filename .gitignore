@@ -6,6 +6,9 @@ __pycache__/
 # macOS
 .DS_Store
 
+# Spotify OAuth refresh token -- a live credential, never commit
+.spotify_token.json
+
 # Your own audio files -- never want these in git history
 AudioFiles/
 *.wav

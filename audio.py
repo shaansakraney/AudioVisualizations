@@ -183,8 +183,42 @@ class WavSource:
         return self.extractor.read(dt)
 
 
+# Virtual/loopback input drivers, in preference order. A loopback device is
+# how you capture what the machine is *playing* (Spotify, a browser, anything)
+# rather than what a mic hears -- macOS gives no way to tap system output
+# without one. See the README for the BlackHole + Multi-Output setup.
+LOOPBACK_HINTS = ("blackhole", "soundflower", "loopback", "vb-cable",
+                  "virtual", "aggregate", "multi-output", "stereo mix")
+
+
+def find_loopback_device():
+    """Index of the first input device that looks like a loopback/virtual
+    driver, or None. Returned index is fed straight to LiveAudioSource,
+    which already takes a device index."""
+    if sd is None:
+        return None
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None
+    for hint in LOOPBACK_HINTS:
+        for i, d in enumerate(devices):
+            if d.get("max_input_channels", 0) > 0 and hint in d["name"].lower():
+                return i
+    return None
+
+
 def list_devices():
     if sd is None:
         print("sounddevice not installed. pip install sounddevice")
         return
     print(sd.query_devices())
+    idx = find_loopback_device()
+    if idx is None:
+        print("\nNo loopback device found. To react to Spotify/system audio:")
+        print("  brew install blackhole-2ch")
+        print("  then in Audio MIDI Setup create a Multi-Output Device")
+        print("  (your speakers + BlackHole) and select it as system output.")
+    else:
+        print(f"\nLoopback device detected: [{idx}] "
+              f"{sd.query_devices()[idx]['name']}  -> use --source loopback")

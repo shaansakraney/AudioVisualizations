@@ -45,8 +45,8 @@ class FeatureExtractor:
     BEAT_SENSITIVITY = 1.4   # bass must exceed running avg * this to count as a beat
     BEAT_FLOOR = 0.15        # ...and be at least this loud (ignores quiet noise)
     BEAT_REFRACTORY = 0.12   # min seconds between beats
-    N_BANDS6 = 6             # bin count for Features.bands
-    BAND6_RANGE_HZ = (20, 16000)  # low..high edge for the 6-bin log spread
+    N_BANDS6 = 16             # bin count for Features.bands
+    BAND6_RANGE_HZ = (20, 21000)  # low..high edge for the 6-bin log spread
     # ------------------------------------------------------------------------
 
     def __init__(self, sample_rate):

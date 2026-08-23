@@ -19,9 +19,10 @@ FPS = 60
 
 
 class App:
-    def __init__(self, source, scenes):
+    def __init__(self, source, scenes, now_playing=None):
         self.source = source
         self.scenes = scenes
+        self.now_playing = now_playing  # NowPlayingProvider or None
         self.scene_idx = 0
         self.show_hud = True
 
@@ -34,6 +35,8 @@ class App:
         font = pygame.font.SysFont("menlo,consolas,monospace", 22)
 
         self.source.start()
+        if self.now_playing is not None:
+            self.now_playing.start()
         running = True
         while running:
             dt = clock.tick(FPS) / 1000.0
@@ -44,15 +47,21 @@ class App:
                     running = False
 
             f = self.source.read(dt)
+            # read() is a cheap snapshot read -- the provider does all its
+            # network work on its own thread (see nowplaying.py)
+            np_ = self.now_playing.read() if self.now_playing is not None else None
             scene = self.scenes[self.scene_idx]
+            scene.now_playing = np_
             scene.update(f, dt)
             scene.draw(canvas)
 
             pygame.transform.scale(canvas, win.get_size(), win)  # upscale onto window
             if self.show_hud:
-                self._draw_hud(win, font, f, clock)
+                self._draw_hud(win, font, f, clock, np_)
             pygame.display.flip()
 
+        if self.now_playing is not None:
+            self.now_playing.stop()
         self.source.stop()
         pygame.quit()
 
@@ -69,14 +78,17 @@ class App:
                 self.scene_idx = idx
         return True
 
-    def _draw_hud(self, win, font, f: Features, clock):
+    def _draw_hud(self, win, font, f: Features, clock, np_=None):
         lines = [
             f"fps {clock.get_fps():4.0f}   source {self.source.name}   "
             f"scene {self.scenes[self.scene_idx].name}",
             f"rms {f.rms:.2f}  bass {f.bass:.2f}  mid {f.mid:.2f}  "
             f"treble {f.treble:.2f}  centroid {f.centroid:.2f}",
-            "keys: 1-9 scene   h hud   esc quit",
         ]
+        if np_ is not None and np_.label():
+            state = "" if np_.playing else " (paused)"
+            lines.append(f"{np_.label()}{state}")
+        lines.append("keys: 1-9 scene   h hud   esc quit")
         y = 12
         for ln in lines:
             win.blit(font.render(ln, True, (255, 255, 255)), (16, y))

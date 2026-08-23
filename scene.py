@@ -12,6 +12,13 @@ from features import Features
 class Scene:
     name = "scene"
 
+    # Set by App every frame to the current NowPlaying (see nowplaying.py),
+    # or left None when Spotify integration is off. This rides alongside
+    # Features rather than inside it on purpose: Features is the audio
+    # contract meant to be reimplemented on a microcontroller, and album art
+    # has no place in it. Scenes that don't care simply never read this.
+    now_playing = None
+
     def update(self, f: Features, dt: float):
         """Advance internal animation state. dt = seconds since the last frame."""
         pass

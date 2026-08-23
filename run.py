@@ -7,6 +7,7 @@ Entry point. Examples:
     python run.py --source mic             # default input device
     python run.py --source line --device 2 # a specific input (see --list-devices)
     python run.py --source wav --wav song.wav  # looked up in AudioFiles/ if not found as-is
+    python run.py --source loopback --spotify  # react to Spotify + show its album art
     python run.py --list-devices
 """
 
@@ -42,20 +43,49 @@ def build_source(args):
             sys.exit("--source wav requires --wav PATH")
         from audio import WavSource
         return WavSource(resolve_wav(args.wav))
+    if args.source == "loopback":
+        from audio import LiveAudioSource, find_loopback_device
+        idx = args.device if args.device is not None else find_loopback_device()
+        if idx is None:
+            print("No loopback device found -- falling back to the microphone.")
+            print("For a clean signal: brew install blackhole-2ch, then make a")
+            print("Multi-Output Device (speakers + BlackHole) in Audio MIDI Setup.")
+        return LiveAudioSource(device=idx)
     # "mic" and "line" are the same code path; the device index picks the input
     from audio import LiveAudioSource
     return LiveAudioSource(device=args.device)
 
 
+def build_now_playing(args):
+    """The Spotify metadata/art provider, or None when --spotify is off or
+    no backend is usable on this machine."""
+    if not args.spotify:
+        return None
+    from nowplaying import build_provider
+    provider = build_provider(args.spotify_source)
+    if provider is None:
+        print("Spotify integration unavailable: no Spotify.app found, and no")
+        print("SPOTIFY_CLIENT_ID set for the Web API backend. Continuing without it.")
+        return None
+    print(f"Spotify: using the {provider.backend.name} backend.")
+    return provider
+
+
 def main():
     p = argparse.ArgumentParser(description="audio-reactive visuals starter")
     p.add_argument("--source", default="resting",
-                   choices=["resting", "mic", "line", "wav"])
+                   choices=["resting", "mic", "line", "wav", "loopback"])
     p.add_argument("--wav", help="path to a .wav file (for --source wav)")
     p.add_argument("--device", type=int, default=None,
                    help="input device index (see --list-devices)")
     p.add_argument("--list-devices", action="store_true",
                    help="print available audio devices and exit")
+    p.add_argument("--spotify", action="store_true",
+                   help="pull the current track's album art + palette from Spotify")
+    p.add_argument("--spotify-source", default="applescript",
+                   choices=["applescript", "web"],
+                   help="applescript = local Spotify app (no setup); "
+                        "web = Web API (needs SPOTIFY_CLIENT_ID)")
     args = p.parse_args()
 
     if args.list_devices:
@@ -66,7 +96,7 @@ def main():
     # Register scenes here. Order = the number keys 1..9 in the window.
     scenes = [PulseScene(), BarsScene(), LightningScene(), CymaticsScene(),
               SpectrumScene(), NebulaScene()]
-    App(build_source(args), scenes).run()
+    App(build_source(args), scenes, now_playing=build_now_playing(args)).run()
 
 
 if __name__ == "__main__":

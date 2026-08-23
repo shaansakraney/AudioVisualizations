@@ -26,12 +26,25 @@ from scene import Scene
 
 
 class PulseScene(Scene):
+    """Breathing orb. With Spotify connected (self.now_playing), the album
+    cover becomes the orb itself -- circle-masked and scaled by the same
+    bass+rms radius -- and the glow/rings/background take their colors from
+    the cover's palette. Without it, everything falls back to the original
+    centroid-driven hue, so resting mode looks exactly as it always did."""
+
     name = "pulse"
+
+    # Orb radius is quantized to this many pixels before the cover is scaled
+    # to it. Without the quantization a continuously-changing radius would
+    # miss fx.circle_masked's cache on literally every frame, turning a
+    # once-per-size smoothscale+mask into a per-frame one.
+    ART_RADIUS_STEP = 4
 
     def __init__(self):
         self.f = None
         self.rings = []  # each ring is [grown_radius, alpha]
         self._scratch = {}
+        self._art_cache = {}
 
     def update(self, f, dt):
         self.f = f
@@ -46,9 +59,18 @@ class PulseScene(Scene):
         w, h = surface.get_size()
         s = scale(surface)
         f = self.f
-        # background: near-black, faintly tinted by brightness + treble
-        surface.fill(hsv(f.centroid if f else 0.6, 0.5,
-                         0.05 + 0.06 * (f.treble if f else 0.0)))
+        np_ = self.now_playing
+        art = np_.art if np_ is not None else None
+        palette = np_.palette if np_ is not None else ()
+
+        # background: near-black. Tinted by the cover's dominant color when
+        # there's a track, else by the original brightness+treble hue.
+        if palette:
+            dom = palette[0]
+            surface.fill((int(dom[0] * 0.10), int(dom[1] * 0.10), int(dom[2] * 0.10)))
+        else:
+            surface.fill(hsv(f.centroid if f else 0.6, 0.5,
+                             0.05 + 0.06 * (f.treble if f else 0.0)))
         if f is None:
             return
 
@@ -57,6 +79,9 @@ class PulseScene(Scene):
         radius = base + (w * 0.32) * (0.5 * f.bass + 0.5 * f.rms)
         radius += (w * 0.05) * f.beat_strength
         hue = f.centroid
+        glow_col = palette[0] if palette else hsv(hue, 0.7, 1.0)
+        core_col = palette[0] if palette else hsv(hue, 0.5, 1.0)
+        ring_col = np_.accent if np_ is not None and palette else hsv(hue + 0.1, 0.6, 1.0)
 
         # soft glow: several translucent circles, faint-and-wide to bright-and-tight.
         # More, tighter-spaced layers than the reference tuning so the falloff
@@ -75,18 +100,30 @@ class PulseScene(Scene):
         gcx, gcy = cx / GLOW_DOWNSCALE, cy / GLOW_DOWNSCALE
         layers = (1.7, 1.55, 1.4, 1.25, 1.1, 1.0)
         for i, k in enumerate(layers):
-            aacircle(glow_small, (*hsv(hue, 0.7, 1.0), 18 + 14 * i),
+            aacircle(glow_small, (*glow_col, 18 + 14 * i),
                      (gcx, gcy), radius * k / GLOW_DOWNSCALE)
         glow = fx.scratch_surface(self._scratch, "glow", (w, h))
         pygame.transform.smoothscale(glow_small, (w, h), glow)
         surface.blit(glow, (0, 0))
-        aacircle(surface, hsv(hue, 0.5, 1.0), (cx, cy), radius)
+
+        # the orb itself: album cover if we have one, else a flat disc
+        if art is not None:
+            # only ever one track's masked cover is worth keeping around
+            if self._art_cache.get("track") != np_.track_id:
+                self._art_cache.clear()
+                self._art_cache["track"] = np_.track_id
+            step = self.ART_RADIUS_STEP
+            d = max(step, int(round(radius * 2 / step)) * step)
+            cover = fx.circle_masked(self._art_cache, "orb", art, d)
+            surface.blit(cover, (cx - d // 2, cy - d // 2))
+        else:
+            aacircle(surface, core_col, (cx, cy), radius)
 
         # expanding beat rings
         ring_width = max(2, round(3 * s))
         rings = fx.scratch_surface(self._scratch, "rings", (w, h))
         for grown, alpha in self.rings:
-            aacircle(rings, (*hsv(hue + 0.1, 0.6, 1.0), int(alpha * 180)),
+            aacircle(rings, (*ring_col, int(alpha * 180)),
                      (cx, cy), base + grown, width=ring_width)
         surface.blit(rings, (0, 0))
 
@@ -143,6 +180,74 @@ class BarsScene(Scene):
                                 (0, line_y + dy), (int(w * f.rms), line_y + dy))
 
 
+# Color schemes take (bar index, bar count, that bar's 0..1 level, Features,
+# NowPlaying-or-None) and return an (r, g, b). `f.t` gives you a clock for
+# animated gradients; `np_` gives you the current album palette (see
+# _spectrum_scheme_album). Schemes ignore whichever they don't need.
+
+def _spectrum_scheme_blue_pink(i, n, val, f, np_):
+    """Static ramp: blue (low freq) -> pink (high freq)."""
+    hue = 0.62 + 0.3 * (i / (n - 1))
+    return hsv(hue, 1, 1.0)
+
+
+def _spectrum_scheme_rainbow_cycle(i, n, val, f, np_):
+    """Full rainbow across the bars, slowly cycling over time."""
+    hue = (i / n + f.t * 0.05) % 1.0
+    return hsv(hue, 1, 1.0)
+
+
+def _spectrum_scheme_reactive(i, n, val, f, np_):
+    """Blue-pink ramp, but each bar's brightness pulses with its own level."""
+    hue = 0.4 + 0.4 * (i / (n - 1))
+    return hsv(hue, 1, 0.55 + 0.45 * val)
+
+
+def _spectrum_scheme_fire(i, n, val, f, np_):
+    """Single hue sweep (red->yellow) driven by how loud each bar is."""
+    hue = 0.02 + 0.12 * val
+    return hsv(hue, 1, 0.6 + 0.4 * val)
+
+
+def _spectrum_scheme_me1(i, n, val, f, np_):
+    hue = 0.5 + 0.37 * val #light blue -> purple
+    #hue = 0.67 + 0.3 * val #blue -> pink
+    #hue = 0.78 - 0.3 * val #purple -> light blue
+    return hsv(hue, 1, 0.7 + 0.3 * val)
+
+
+def _spectrum_scheme_me2(i, n, val, f, np_):
+    hue = 0.67 + 0.2 * val
+    return hsv(hue, 1, 0.6 + 0.4 * val)
+
+
+def _spectrum_scheme_album(i, n, val, f, np_):
+    """Colors sampled straight from the current album cover -- one palette
+    entry per bin, brightness pulsing with that bin's level. Falls back to
+    the fire ramp when no track is playing, so it's always safe to leave
+    selected. fx.palette_from_surface merges near-duplicate colors and so
+    can return fewer than n entries -- hence the modulo."""
+    palette = np_.palette if np_ is not None else ()
+    if not palette:
+        return _spectrum_scheme_fire(i, n, val, f, np_)
+    r, g, b = palette[i % len(palette)]
+    k = 0.55 + 0.45 * val
+    return int(r * k), int(g * k), int(b * k)
+
+
+# Registry of selectable color schemes -- add new ones above and list them
+# here, then flip SpectrumScene.COLOR_SCHEME (or the scheme kwarg) to swap.
+SPECTRUM_COLOR_SCHEMES = {
+    "blue_pink": _spectrum_scheme_blue_pink,
+    "rainbow": _spectrum_scheme_rainbow_cycle,
+    "reactive": _spectrum_scheme_reactive,
+    "fire": _spectrum_scheme_fire,
+    "me1": _spectrum_scheme_me1,
+    "me2": _spectrum_scheme_me2,
+    "album": _spectrum_scheme_album,
+}
+
+
 class SpectrumScene(Scene):
     """Apple-Music-style 6-bin spectrum: bars laid out left-to-right, each
     growing symmetrically up and down from a horizontal center line as its
@@ -150,9 +255,31 @@ class SpectrumScene(Scene):
 
     name = "spectrum"
 
+    # Active palette -- change this key (see SPECTRUM_COLOR_SCHEMES above)
+    # to try a different color scheme; each scheme is just a function of
+    # (bar index, bar count, that bar's 0..1 level, Features, NowPlaying)
+    # -> (r, g, b), so f.t is available for time-based/animated gradients
+    # and np_.palette for album-derived ones.
+    COLOR_SCHEME = "me1"
+
+    # When a Spotify track is playing, override COLOR_SCHEME with "album"
+    # so the bars take the cover's colors. Set False to keep your own
+    # scheme regardless of what's playing.
+    USE_ALBUM_COLORS = True
+
+    # Draw the cover blurred + darkened behind the bars.
+    SHOW_ALBUM_BACKDROP = True
+
+    # Fraction of each bin's slot width the bar actually fills (0..1).
+    # Lower = narrower bars with more gap between them; the bin's center
+    # position doesn't move since it's computed from the slot, not the bar.
+    BAR_WIDTH_FRAC = 0.9
+
     def __init__(self):
         self.f = None
         self._scratch = {}
+        self._art_cache = {}
+        self.color_fn = SPECTRUM_COLOR_SCHEMES[self.COLOR_SCHEME]
 
     def update(self, f, dt):
         self.f = f
@@ -161,33 +288,55 @@ class SpectrumScene(Scene):
         w, h = surface.get_size()
         s = scale(surface)
         f = self.f
+        np_ = self.now_playing
+        art = np_.art if np_ is not None else None
+
         flash = int(30 * (f.beat_strength if f else 0.0))
         surface.fill((6 + flash, 6 + flash, 10 + flash))
+        if art is not None and self.SHOW_ALBUM_BACKDROP:
+            if self._art_cache.get("track") != np_.track_id:
+                self._art_cache.clear()
+                self._art_cache["track"] = np_.track_id
+            surface.blit(fx.blurred_backdrop(self._art_cache, "bg", art, (w, h)),
+                         (0, 0))
         if f is None:
             return
+
+        # album colors take over while something is playing, then hand back
+        # to whatever scheme was selected once it stops
+        color_fn = self.color_fn
+        if self.USE_ALBUM_COLORS and np_ is not None and np_.palette:
+            color_fn = _spectrum_scheme_album
 
         bands = f.bands
         n = len(bands)
         gap = max(6, round(10 * s))
-        corner = max(3, round(4 * s))
         cy = h // 2
         max_half = (h - gap * 2) / 2.0
-        bw = (w - gap * (n + 1)) // n
+        # slot = fixed center-to-center spacing for each bin; bw is a
+        # fraction of that slot, so BAR_WIDTH_FRAC resizes bars in place
+        # instead of also changing where their centers sit.
+        slot = (w - gap * (n + 1)) / n
+        #print(f"{slot}    {w}    {h}    {gap}    {n}    {cy}")
+        bw = max(4, int(slot * self.BAR_WIDTH_FRAC))
+        pill = bw // 2  # border_radius == half the bar width -> fully round ends
 
         glow = fx.scratch_surface(self._scratch, "glow", (w, h))
         rects = []
         for i, val in enumerate(bands):
-            hue = 0.62 - 0.5 * (i / (n - 1))  # blue (low) -> pink (high)
-            col = hsv(hue, 0.75, 1.0)
-            half = max(2, int(max_half * val))
-            x = gap + i * (bw + gap)
+            col = color_fn(i, n, val, f, np_)
+            #old method
+            #half = max(int(max_half * val), bw / 2) 
+            half = int(max_half * val) #current version
+            slot_cx = gap + i * (slot + gap) + slot / 2
+            x = int(slot_cx - bw / 2)
             rect = (x, cy - half, bw, half * 2)
             rects.append((rect, col))
             pygame.draw.rect(glow, (*col, 60), pygame.Rect(rect).inflate(gap, gap),
-                              border_radius=corner * 2)
+                              border_radius=pill + gap // 2)
         surface.blit(glow, (0, 0))
         for rect, col in rects:
-            pygame.draw.rect(surface, col, rect, border_radius=corner)
+            pygame.draw.rect(surface, col, rect, border_radius=pill)
 
 
 class LightningScene(Scene):

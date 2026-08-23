@@ -2,7 +2,7 @@
 fx.py
 -----
 Shared rendering/math infrastructure that scenes compose instead of
-re-deriving. Four pieces:
+re-deriving. Five pieces:
 
 - color/scale helpers   (hsv, scale, aacircle, fade)      -- used by everyone
 - Particles              a vectorized particle system      -- Nebula today;
@@ -14,6 +14,10 @@ re-deriving. Four pieces:
                                                                "electric" motif
 - field_grid / draw_field                                  -- Cymatics today;
                                                                Plasma later
+- palette_from_surface / circle_masked / blurred_backdrop  -- album art in
+                                                               Pulse+Spectrum;
+                                                               any image-driven
+                                                               visual later
 
 Physics/geometry (particle updates, bolt paths, field math) is vectorized
 with numpy; only actual pygame draw calls loop per-object, since pygame has
@@ -295,6 +299,33 @@ def _hsv_array_to_rgb(h, s, v):
     return np.clip(rgb * 255, 0, 255).astype(np.uint8)
 
 
+def _rgb_array_to_hsv(rgb):
+    """Vectorized RGB->HSV. `rgb` is (..., 3) in 0..1; returns h, s, v arrays
+    each shaped like rgb[..., 0]. Counterpart to _hsv_array_to_rgb below --
+    used by palette_from_surface to score colors by vividness."""
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    mx = np.max(rgb, axis=-1)
+    mn = np.min(rgb, axis=-1)
+    diff = mx - mn
+
+    h = np.zeros_like(mx)
+    mask = diff > 1e-9
+    # which channel is the max decides which 60-degree sector the hue is in
+    rm = mask & (mx == r)
+    gm = mask & (mx == g) & ~rm
+    bm = mask & (mx == b) & ~rm & ~gm
+    with np.errstate(invalid="ignore", divide="ignore"):
+        h[rm] = ((g[rm] - b[rm]) / diff[rm]) % 6.0
+        h[gm] = ((b[gm] - r[gm]) / diff[gm]) + 2.0
+        h[bm] = ((r[bm] - g[bm]) / diff[bm]) + 4.0
+    h = h / 6.0
+
+    s = np.zeros_like(mx)
+    nz = mx > 1e-9
+    s[nz] = diff[nz] / mx[nz]
+    return h, s, mx
+
+
 def draw_field(dst_surface, res, field_fn, sat=0.8):
     """Compute a procedural field at low resolution `res=(w, h)`, colorize
     it, upscale, and blit onto dst_surface. `field_fn(X, Y)` receives the
@@ -314,3 +345,136 @@ def draw_field(dst_surface, res, field_fn, sat=0.8):
     field_surf = pygame.surfarray.make_surface(rgb.transpose(1, 0, 2))
     scaled = pygame.transform.smoothscale(field_surf, dst_surface.get_size())
     dst_surface.blit(scaled, (0, 0))
+
+
+# ---------------------------------------------------------------------------
+# Album art / palette
+# ---------------------------------------------------------------------------
+
+def palette_from_surface(surface, n=6, sample=64, min_dist=0.12):
+    """Extract up to `n` prominent colors from an image (an album cover,
+    typically) as a tuple of (r, g, b) ints, most prominent first.
+
+    Downscales to `sample`x`sample` first so the clustering runs on a few
+    thousand pixels instead of a few hundred thousand -- the same
+    compute-small-then-use-big trick draw_field() relies on. Near-black,
+    near-white and washed-out pixels are dropped before clustering, since
+    cover art is usually mostly background and those colors make for a dull
+    palette. Clusters are ranked by population * vividness so a small but
+    saturated accent can still outrank a large muddy region.
+
+    Colors closer together than `min_dist` (RGB euclidean, 0..1 scale) are
+    merged, so a cover with only two real colors returns two entries rather
+    than six near-identical ones. **That means the result can be shorter
+    than `n`** -- index it with `palette[i % len(palette)]`.
+
+    Falls back to a neutral gray if the image has no usable color.
+    """
+    small = pygame.transform.smoothscale(surface, (sample, sample))
+    px = pygame.surfarray.array3d(small).reshape(-1, 3).astype(np.float32) / 255.0
+
+    h, s, v = _rgb_array_to_hsv(px)
+    # Filter on saturation, NOT on a value ceiling: a fully-saturated color
+    # like pure orange has v == 1.0 (its red channel is maxed), so a
+    # `v < 0.97` "drop near-white" test would throw away exactly the vivid
+    # colors cover art is built from. White/gray are already excluded here
+    # because their saturation is ~0.
+    keep = (v > 0.15) & (s > 0.18)
+    pts = px[keep] if keep.sum() >= n else px
+    if len(pts) < n:
+        return ((160, 160, 160),)
+
+    # k-means, deterministic init: spread the seeds over the value-sorted
+    # points so we don't depend on RNG state and get a stable palette for a
+    # given cover every time.
+    order = np.argsort(pts[:, 0] * 0.3 + pts[:, 1] * 0.6 + pts[:, 2] * 0.1)
+    seeds = np.linspace(0, len(pts) - 1, n).astype(int)
+    centers = pts[order[seeds]].copy()
+
+    for _ in range(12):
+        d = np.linalg.norm(pts[:, None, :] - centers[None, :, :], axis=2)
+        labels = np.argmin(d, axis=1)
+        for k in range(n):
+            m = labels == k
+            if m.any():
+                centers[k] = pts[m].mean(axis=0)
+
+    counts = np.array([(labels == k).sum() for k in range(n)], dtype=np.float32)
+    _, cs, cv = _rgb_array_to_hsv(centers)
+    score = (counts / max(1.0, counts.sum())) * (0.35 + cs * cv)
+    ranked = centers[np.argsort(-score)]
+
+    # merge near-duplicates, keeping the higher-ranked one -- k-means on a
+    # cover with only 2-3 real colors otherwise returns several copies of
+    # the same shade plus muddy midpoints between them
+    out = []
+    for c in ranked:
+        if all(np.linalg.norm(c - k) >= min_dist for k in out):
+            out.append(c)
+    return tuple(
+        (int(c[0] * 255), int(c[1] * 255), int(c[2] * 255)) for c in out
+    )
+
+
+def most_vivid(palette, fallback=(255, 255, 255)):
+    """Pick the most saturated-and-bright entry of a palette -- the color you
+    want for highlights (beat rings, accents) where the dominant color is
+    often too dark or too muted to read against the background."""
+    if not palette:
+        return fallback
+    arr = np.array(palette, dtype=np.float32).reshape(-1, 3) / 255.0
+    _, s, v = _rgb_array_to_hsv(arr)
+    return tuple(int(c) for c in palette[int(np.argmax(s * v))])
+
+
+def circle_masked(cache, key, art, diameter):
+    """The image `art` scaled to `diameter` and clipped to a circle, cached
+    under `key` in the caller's dict so a scene redrawing the same cover at
+    the same size every frame pays the scale+mask cost once.
+
+    Callers should quantize `diameter` (e.g. round to the nearest few px)
+    before calling, otherwise a smoothly-animating radius produces a cache
+    miss on every single frame and this saves nothing."""
+    diameter = max(2, int(diameter))
+    entry = cache.get(key)
+    if entry is not None and entry[0] == diameter:
+        return entry[1]
+
+    scaled = pygame.transform.smoothscale(art, (diameter, diameter))
+    out = pygame.Surface((diameter, diameter), pygame.SRCALPHA)
+    out.blit(scaled, (0, 0))
+    # white circle in the alpha channel, then multiply -> everything outside
+    # the circle becomes fully transparent
+    mask = pygame.Surface((diameter, diameter), pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    r = diameter // 2
+    gfxdraw.filled_circle(mask, r, r, max(1, r - 1), (255, 255, 255, 255))
+    gfxdraw.aacircle(mask, r, r, max(1, r - 1), (255, 255, 255, 255))
+    out.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+
+    cache[key] = (diameter, out)
+    return out
+
+
+def blurred_backdrop(cache, key, art, size, darken=195, downscale=14):
+    """A cheap blurred, darkened copy of `art` filling `size` -- for using a
+    cover as a full-screen background without it fighting the foreground.
+
+    The "blur" is just a hard downscale followed by a smooth upscale, the
+    same trick draw_field() uses; it costs almost nothing compared to a real
+    convolution and looks right for a soft backdrop. Cached by (size,
+    darken) under `key` since the result only changes when the track does."""
+    size = (int(size[0]), int(size[1]))
+    entry = cache.get(key)
+    if entry is not None and entry[0] == (size, darken):
+        return entry[1]
+
+    tiny = pygame.transform.smoothscale(art, (downscale, downscale))
+    out = pygame.transform.smoothscale(tiny, size)
+    shade = pygame.Surface(size)
+    shade.fill((0, 0, 0))
+    shade.set_alpha(darken)
+    out.blit(shade, (0, 0))
+
+    cache[key] = ((size, darken), out)
+    return out
