@@ -332,6 +332,12 @@ def draw_field(dst_surface, res, field_fn, sat=0.8):
     cached coordinate grids and must return `(hue, value)` arrays shaped
     like X/Y, each roughly 0..1 (hue wraps, value is clipped).
 
+    It may also return a third element, `(hue, value, sat)`, to override the
+    `sat` argument -- either a scalar or a full array for per-pixel
+    saturation. That lets a caller whose palette decides its own saturation
+    (see CYMATICS_COLOR_SCHEMES) keep hue and saturation together in one
+    function instead of splitting them across two call sites.
+
     Doing this per-pixel in Python at full canvas resolution would be far
     too slow; computing it vectorized-with-numpy at low res and upscaling
     with smoothscale is the standard trick, and it keeps the soft/painterly
@@ -339,8 +345,14 @@ def draw_field(dst_surface, res, field_fn, sat=0.8):
     """
     w, h = res
     X, Y = field_grid(w, h)
-    hue, value = field_fn(X, Y)
-    sat_arr = np.full_like(hue, sat, dtype=np.float32)
+    result = field_fn(X, Y)
+    if len(result) == 3:
+        hue, value, sat = result
+    else:
+        hue, value = result
+    sat_arr = (np.clip(sat, 0.0, 1.0).astype(np.float32)
+               if isinstance(sat, np.ndarray)
+               else np.full_like(hue, float(np.clip(sat, 0.0, 1.0)), dtype=np.float32))
     rgb = _hsv_array_to_rgb(np.mod(hue, 1.0), sat_arr, np.clip(value, 0.0, 1.0))
     field_surf = pygame.surfarray.make_surface(rgb.transpose(1, 0, 2))
     scaled = pygame.transform.smoothscale(field_surf, dst_surface.get_size())

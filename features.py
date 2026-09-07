@@ -41,7 +41,18 @@ class FeatureExtractor:
     BANDS = {"bass": (20, 250), "mid": (250, 2000), "treble": (2000, 8000)}
     ATTACK = 0.6             # envelope: how fast features rise toward a peak
     RELEASE = 0.15           # envelope: how slowly they fall back (the "musical" feel)
-    PEAK_DECAY = 0.999       # auto-gain: how fast the running peak forgets (per frame)
+    PEAK_DECAY = 0.9999      # auto-gain: how fast the running peak forgets (per frame).
+                             # This sets how long "loud" is remembered: half-life is
+                             # log(0.5)/log(PEAK_DECAY) frames, so 0.999 = ~11s and
+                             # 0.9999 = ~2min at 60fps. It must be long compared to a
+                             # song's structure, or the AGC re-normalizes a quiet verse
+                             # up to full scale and the visuals stop tracking dynamics
+                             # -- measured on a real track, 0.999 gave only a 1.65x
+                             # radius spread between the quietest and loudest fifths of
+                             # the song (correlation 0.70 with true loudness); 0.9999
+                             # gives 2.0x at 0.86. Past ~0.9999 it stops improving.
+                             # The cost of a longer memory: one loud transient (a door
+                             # slam into the mic) pins the peak high for minutes.
     BEAT_SENSITIVITY = 1.4   # bass must exceed running avg * this to count as a beat
     BEAT_FLOOR = 0.15        # ...and be at least this loud (ignores quiet noise)
     BEAT_REFRACTORY = 0.12   # min seconds between beats
