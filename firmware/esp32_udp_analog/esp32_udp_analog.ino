@@ -7,10 +7,13 @@
 //
 // SETUP
 //   1. Arduino IDE -> Boards Manager -> install "esp32" by Espressif.
-//   2. Fill in WIFI_SSID / WIFI_PASS below. (No FastLED needed here.)
-//   3. Upload, open Serial Monitor at 115200 -- it prints its IP.
-//   4. On the Mac:
-//        python run.py --source mic --leds udp://<that-ip>:4210 --led-count 1
+//   2. cp wifi_secrets.example.h wifi_secrets.h and fill in your network.
+//      (No FastLED needed here.)
+//   3. Upload, open Serial Monitor at 115200 -- it prints its name and IP.
+//   4. On the Mac (the NAME, not the IP -- see HOSTNAME below):
+//        python run.py --source mic --leds udp://audioviz.local:4210 --led-count 1
+//   Step by step, including moving the board to a wall socket:
+//   firmware/QUICKSTART.md
 //
 // WIRING -- read this before buying parts
 //   An ESP32 pin sources ~20mA at 3.3V; a 12V strip draws amps. You need one
@@ -35,15 +38,30 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include "av_proto.h"
+#include "av_net.h"
 
 // ---- configure me ---------------------------------------------------------
-static const char *WIFI_SSID = "YOUR_WIFI_NAME";
-static const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
+// Credentials live in wifi_secrets.h beside this file (gitignored) so they
+// never reach git: copy wifi_secrets.example.h to wifi_secrets.h and fill it in.
+#if __has_include("wifi_secrets.h")
+  #include "wifi_secrets.h"
+#else
+  #define WIFI_SSID_VALUE "YOUR_WIFI_NAME"
+  #define WIFI_PASS_VALUE "YOUR_WIFI_PASSWORD"
+#endif
+static const char *WIFI_SSID = WIFI_SSID_VALUE;
+static const char *WIFI_PASS = WIFI_PASS_VALUE;
 
 #define PIN_R     25
 #define PIN_G     26
 #define PIN_B     27
 #define UDP_PORT  4210
+
+// The board's name on the network. It takes its ADDRESS from DHCP as usual,
+// but answers to <HOSTNAME>.local over mDNS, so unplugging it from the wall
+// and plugging it back in can't invalidate your command line even if the
+// router hands out a different IP. Change it only if you run two of these.
+#define HOSTNAME  "audioviz"
 
 // Set true if your strip is COMMON CATHODE (pins are GND/R/G/B) or your
 // driver board inverts. Symptom of getting this wrong: the strip is at full
@@ -93,23 +111,21 @@ void setup() {
   AV_LEDC_ATTACH(PIN_B, 2);
   writeRGB(0, 0, 0);
 
-  Serial.printf("\nconnecting to %s", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
-    Serial.print(".");
-  }
-  udp.begin(UDP_PORT);
+  // Non-blocking: the idle breath below runs while this connects, so a board
+  // that boots faster than the router still lights up and joins when it can.
+  avNetBegin(WIFI_SSID, WIFI_PASS, HOSTNAME);
 
-  Serial.printf("\n\naudioviz LED receiver (analog RGB) ready\n");
-  Serial.printf("  IP       : %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("audioviz LED receiver (analog RGB) ready\n");
   Serial.printf("  UDP port : %d\n", UDP_PORT);
-  Serial.printf("\n  run: python run.py --leds udp://%s:%d --led-count 1\n\n",
-                WiFi.localIP().toString().c_str(), UDP_PORT);
+  Serial.printf("\n  run: python run.py --leds udp://%s.local:%d --led-count 1\n\n",
+                HOSTNAME, UDP_PORT);
 }
 
 void loop() {
+  // Rebind the socket whenever the link comes back: the old one is bound to
+  // an address the interface no longer holds.
+  if (avNetLoop()) udp.begin(UDP_PORT);
+
   int size = udp.parsePacket();
   if (size > 0) {
     int len = udp.read(packet, sizeof(packet));

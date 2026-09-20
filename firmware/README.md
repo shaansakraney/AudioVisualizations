@@ -10,6 +10,11 @@ goes dead.
 run.py ──UDP:4210──> ESP32 ──> strip
 ```
 
+**Setting up a board right now?** [`QUICKSTART.md`](QUICKSTART.md) is the
+linear checklist — toolchain, credentials, flashing, the serial-monitor check,
+the IP question, and moving the board to a wall socket. This file is the
+reference behind it.
+
 ## Which sketch?
 
 Identify your strip by its pins — this is the one thing that actually matters:
@@ -90,14 +95,20 @@ Terminal A becomes a fake strip made of colored blocks. Press `1`–`9` to switc
 scenes: `pulse` should be one solid color, `spectrum` a gradient that moves
 with the music. If this works, every remaining problem is hardware or network.
 
-**2. Flash the sketch.** Fill in `WIFI_SSID` / `WIFI_PASS` / `LED_COUNT` at the
-top, upload, then open Serial Monitor at **115200**. It prints its IP and the
+**2. Flash the sketch.** Copy `wifi_secrets.example.h` to `wifi_secrets.h`
+beside the sketch and fill in your 2.4GHz network (it's gitignored, so
+credentials never reach git), set `LED_COUNT` at the top of the `.ino`, upload,
+then open Serial Monitor at **115200**. It prints its IP and the
 exact command to run:
 
 ```
 audioviz LED receiver ready
-  IP        : 192.168.1.50
-  run: python run.py --leds udp://192.168.1.50:4210 --led-count 60
+  UDP port  : 4210
+  LEDs      : 60
+
+WiFi up
+  name : audioviz.local
+  IP   : 192.168.1.50  (DHCP -- may change; prefer the name)
 ```
 
 Before Python is running you should already see the idle breathing animation.
@@ -107,13 +118,53 @@ separates hardware problems from networking ones.
 **3. Point Python at it.**
 
 ```bash
-python run.py --source loopback --spotify --leds udp://192.168.1.50:4210 --led-count 60
+python run.py --source loopback --spotify --leds udp://audioviz.local:4210 --led-count 60
 ```
 
 Press `h` for the HUD; the `leds` line shows the target and frames sent.
 
+**3b. Once it's on a wall socket, there is no serial monitor.** That's what
+`tools/find_leds.py` is for — it resolves the name, reports the address DHCP
+handed out, and walks the strip through red/green/blue:
+
+```bash
+python tools/find_leds.py --led-count 1
+```
+
 **4. Check the fallback.** Quit `run.py`. After ~1 second the strip should
 return to breathing, and pick straight back up when you restart.
+
+## Addressing — why it's a name, not an IP
+
+The board takes its address from **DHCP**, like everything else on your
+network, and the router is free to hand it a different one each time it boots
+— which is exactly what happens when you unplug it from the wall and plug it
+back in. So nothing here refers to it by IP. Instead it registers a fixed
+**mDNS name** and you point Python at that:
+
+```bash
+python run.py --leds udp://audioviz.local:4210 --led-count 1
+```
+
+`audioviz.local` resolves to whatever DHCP just gave it, so the command line
+keeps working across reboots, lease changes and moving the board to another
+room. The name is the `HOSTNAME` define at the top of each sketch; change it
+only if you run two boards, and give the second one its own name.
+
+The Python side resolves that name on a thread of its own and re-checks it
+every 30 seconds, because a failed `.local` lookup on macOS blocks for a full
+5 seconds and the sender thread can't afford that. Consequences worth knowing:
+
+- You can start `run.py` **before** the board has joined; the strip picks up
+  within ~5s of it appearing, with no restart.
+- If the board's address changes while `run.py` is running, the strip
+  resumes within ~30s on its own.
+- The raw IP still works (`--leds udp://192.168.1.50:4210`) and skips
+  resolution entirely — useful if mDNS is blocked on your network.
+
+Connection is non-blocking on the firmware side too: the board runs its idle
+animation while it joins, so plugging it into the wall before the router has
+finished booting is fine, and it rejoins by itself if WiFi drops.
 
 ## Wiring
 
@@ -136,14 +187,15 @@ will only partly turn on from 3.3V: dim output, hot transistor. A ready-made
 | Symptom | Cause |
 |---|---|
 | Never connects to WiFi (dots forever) | ESP32s are **2.4GHz only**. If your router presents one merged SSID, the Mac may be on 5GHz and the ESP32 can't join at all — enable the 2.4GHz band or use a separate SSID for it. Also check the password and that it's not a captive-portal/guest network. |
-| Idle breathing never stops | Connected, but frames aren't arriving. Wrong IP, the two devices are on different networks/VLANs, or macOS firewall is blocking outbound UDP. |
+| Idle breathing never stops | Connected, but frames aren't arriving. The two devices are on different networks/VLANs, or macOS firewall is blocking outbound UDP. |
+| `audioviz.local` never resolves | `ping audioviz.local` from the Mac. If that fails but the serial monitor shows an IP, mDNS is being blocked (guest networks and some mesh routers do this) — use the IP directly, or give the board a DHCP reservation in the router so the IP stops moving. |
 | Strip stays dark, no idle either | Power or wiring. Confirm the sketch reached "ready" on serial. |
 | Only part of the strip lights | `--led-count` is lower than `LED_COUNT` in the sketch. Make them match. |
 | Full brightness when silent, dark when loud | Analog only: flip `INVERT_OUTPUT` — you have a common-cathode strip or an inverting driver. |
 | First LED glitches, others fine | WS2812 level shifting — see above. |
-| Colors are washed out / everything looks white | Lower `--led-brightness`, or raise `GAMMA` in `led.py`. |
-| Reacts but doesn't pulse on the beat | Beat detection isn't firing, not an LED problem: check the HUD's beat dot and tune `BEAT_SENSITIVITY` in `features.py`. |
-| HUD `dropped` climbing fast | Weak WiFi. A few drops are normal and invisible. |
+| Colors are washed out / everything looks white | Press `l` in the window and lower **brightness**, or raise **gamma**. |
+| Reacts but doesn't pulse on the beat | Beat detection isn't firing, not an LED problem: check the HUD's beat dot and tune `BEAT_SENSITIVITY` in `features.py`. (Check **beat gain** in the `l` panel isn't at 0 first.) |
+| `tools/led_monitor.py` reports drops climbing fast | Weak WiFi. A few drops are normal and invisible on a real strip. |
 
 ## Changing the protocol
 
@@ -155,3 +207,6 @@ headers sitting beside the `.ino` — if you edit one, copy it to the other:
 ```bash
 cp firmware/esp32_udp_ws2812/av_proto.h firmware/esp32_udp_analog/av_proto.h
 ```
+
+`av_net.h` — the WiFi/mDNS bring-up both sketches share — is duplicated for
+the same reason and under the same rule.

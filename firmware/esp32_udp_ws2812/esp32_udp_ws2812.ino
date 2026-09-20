@@ -10,10 +10,13 @@
 // SETUP
 //   1. Arduino IDE -> Boards Manager -> install "esp32" by Espressif.
 //   2. Library Manager -> install "FastLED".
-//   3. Fill in WIFI_SSID / WIFI_PASS / LED_COUNT below.
-//   4. Upload, then open Serial Monitor at 115200 -- it prints its IP address.
-//   5. On the Mac:
-//        python run.py --source mic --leds udp://<that-ip>:4210 --led-count <LED_COUNT>
+//   3. cp wifi_secrets.example.h wifi_secrets.h and fill in your network,
+//      then set LED_COUNT below to match your strip.
+//   4. Upload, then open Serial Monitor at 115200 -- it prints its name and IP.
+//   5. On the Mac (the NAME, not the IP -- see HOSTNAME below):
+//        python run.py --source mic --leds udp://audioviz.local:4210 --led-count <LED_COUNT>
+//   Step by step, including moving the board to a wall socket:
+//   firmware/QUICKSTART.md
 //
 // WIRING
 //   DIN  <- GPIO 5 (through a 330 ohm resistor, close to the strip)
@@ -32,14 +35,29 @@
 #include <WiFiUdp.h>
 #include <FastLED.h>
 #include "av_proto.h"
+#include "av_net.h"
 
 // ---- configure me ---------------------------------------------------------
-static const char *WIFI_SSID = "YOUR_WIFI_NAME";
-static const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
+// Credentials live in wifi_secrets.h beside this file (gitignored) so they
+// never reach git: copy wifi_secrets.example.h to wifi_secrets.h and fill it in.
+#if __has_include("wifi_secrets.h")
+  #include "wifi_secrets.h"
+#else
+  #define WIFI_SSID_VALUE "YOUR_WIFI_NAME"
+  #define WIFI_PASS_VALUE "YOUR_WIFI_PASSWORD"
+#endif
+static const char *WIFI_SSID = WIFI_SSID_VALUE;
+static const char *WIFI_PASS = WIFI_PASS_VALUE;
 
 #define LED_PIN     5
 #define LED_COUNT   60      // must match --led-count on the Python side
 #define UDP_PORT    4210
+
+// The board's name on the network. It takes its ADDRESS from DHCP as usual,
+// but answers to <HOSTNAME>.local over mDNS, so unplugging it from the wall
+// and plugging it back in can't invalidate your command line even if the
+// router hands out a different IP. Change it only if you run two of these.
+#define HOSTNAME    "audioviz"
 #define MAX_MILLIAMPS 2000  // FastLED brownout guard; match your PSU
 // ---------------------------------------------------------------------------
 
@@ -60,24 +78,22 @@ void setup() {
   FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MILLIAMPS);
   FastLED.clear(true);
 
-  Serial.printf("\nconnecting to %s", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
-    Serial.print(".");
-  }
-  udp.begin(UDP_PORT);
+  // Non-blocking: the idle animation below runs while this connects, so a
+  // board that boots faster than the router still lights up and joins later.
+  avNetBegin(WIFI_SSID, WIFI_PASS, HOSTNAME);
 
-  Serial.printf("\n\naudioviz LED receiver ready\n");
-  Serial.printf("  IP        : %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("audioviz LED receiver ready\n");
   Serial.printf("  UDP port  : %d\n", UDP_PORT);
   Serial.printf("  LEDs      : %d\n", LED_COUNT);
-  Serial.printf("\n  run: python run.py --leds udp://%s:%d --led-count %d\n\n",
-                WiFi.localIP().toString().c_str(), UDP_PORT, LED_COUNT);
+  Serial.printf("\n  run: python run.py --leds udp://%s.local:%d --led-count %d\n\n",
+                HOSTNAME, UDP_PORT, LED_COUNT);
 }
 
 void loop() {
+  // Rebind the socket whenever the link comes back: the old one is bound to
+  // an address the interface no longer holds.
+  if (avNetLoop()) udp.begin(UDP_PORT);
+
   int size = udp.parsePacket();
   if (size > 0) {
     int len = udp.read(packet, sizeof(packet));

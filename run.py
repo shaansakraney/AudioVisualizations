@@ -13,32 +13,17 @@ Entry point. Examples:
     python run.py --fullscreen --display 1     # ...on a second monitor / TV
 
     # drive an LED strip alongside the screen (see README: LED strip output)
-    python run.py --source mic --leds udp://192.168.1.50:4210 --led-count 60
+    python run.py --source mic --leds udp://audioviz.local:4210 --led-count 60
     python run.py --leds udp://127.0.0.1:4210 --led-count 16   # + led_monitor.py
 """
 
 import argparse
-import os
 import sys
 
 from app import App
-from scenes import (PulseScene, BarsScene, LightningScene, NebulaScene,
-                     CymaticsScene, SpectrumScene, ConstellationScene)
-
-AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AudioFiles")
-
-
-def resolve_wav(path):
-    """Accept a bare filename (looked up in AudioFiles/) or a full/relative
-    path as-is, so `--wav song.wav` just works if it's dropped in AudioFiles/
-    without needing the full path spelled out every time."""
-    if os.path.isfile(path):
-        return path
-    candidate = os.path.join(AUDIO_DIR, path)
-    if os.path.isfile(candidate):
-        return candidate
-    sys.exit(f"--wav {path!r} not found (looked in cwd and {AUDIO_DIR})")
-
+from scenes import (PulseScene, SpectrumScene, CymaticsScene,
+                    ConstellationScene, ChasmScene, VortexScene,
+                    ResonanceScene, CartographScene, LatticeScene)
 
 def build_source(args):
     if args.source == "resting":
@@ -47,7 +32,7 @@ def build_source(args):
     if args.source == "wav":
         if not args.wav:
             sys.exit("--source wav requires --wav PATH")
-        from audio import WavSource
+        from audio import WavSource, resolve_wav
         return WavSource(resolve_wav(args.wav))
     if args.source == "loopback":
         from audio import LiveAudioSource, find_loopback_device
@@ -90,12 +75,39 @@ def parse_canvas(spec):
 
 def build_led_sink(args):
     """The LED strip output, or a no-op sink when --leds is off (the sink is
-    always constructed so the render loop has no special cases)."""
+    always constructed so the render loop has no special cases).
+
+    The profile comes off disk if it's there, so a strip you tuned in a
+    previous session comes back tuned. --led-brightness still wins when it is
+    given explicitly, since a flag you typed should beat a saved file."""
     from led import build_sink
-    sink = build_sink(args.leds, args.led_count, args.led_brightness)
+    from ledprofile import LedProfile
+    profile = LedProfile.load(args.led_profile)
+    if args.led_brightness is not None:
+        profile.brightness = max(0.0, min(1.0, args.led_brightness))
+    sink = build_sink(args.leds, args.led_count, profile)
     if args.leds and args.leds != "none":
         print(f"LEDs: {sink.stats()}")
+        print(f"      profile {profile.path} -- press l in the window to tune")
     return sink
+
+
+def build_output_switcher(args):
+    """The system-output borrow, or None when it is off.
+
+    On by default for --source loopback (which is unusable without a
+    Multi-Output device selected) and off for every other source, since a mic
+    or wav run has no reason to touch what you are listening through."""
+    want = args.switch_output
+    if want is None:
+        want = args.source == "loopback"
+    if want is False or want == "none":
+        return None
+    from outputswitch import OutputSwitcher, DEFAULT_TARGET
+    target = DEFAULT_TARGET if want is True else want
+    switcher = OutputSwitcher(target)
+    switcher.switch()
+    return switcher
 
 
 def main():
@@ -107,6 +119,13 @@ def main():
                    help="input device index (see --list-devices)")
     p.add_argument("--list-devices", action="store_true",
                    help="print available audio devices and exit")
+    p.add_argument("--switch-output", nargs="?", const=True, default=None,
+                   metavar="DEVICE",
+                   help="borrow a system output device for this run and put "
+                        "the old one back on exit (macOS, needs "
+                        "switchaudio-osx). Bare flag = 'Multi-Output Device'; "
+                        "the default with --source loopback. "
+                        "--switch-output=none opts out.")
     p.add_argument("--spotify", action="store_true",
                    help="pull the current track's album art + palette from Spotify")
     p.add_argument("--spotify-source", default="applescript",
@@ -132,12 +151,20 @@ def main():
                         "identically at any window size, but get resampled")
     p.add_argument("--leds", default="none",
                    help="LED strip output: none, udp://HOST:PORT (ESP32 over "
-                        "WiFi), or serial:///dev/tty... (USB)")
+                        "WiFi -- HOST can be the board's mDNS name, "
+                        "audioviz.local, which survives a DHCP address "
+                        "change), or serial:///dev/tty... (USB)")
     p.add_argument("--led-count", type=int, default=60,
                    help="number of LEDs on the strip (use 1 for an analog "
                         "RGB strip, which is one color end to end)")
-    p.add_argument("--led-brightness", type=float, default=1.0,
-                   help="global LED brightness, 0..1")
+    p.add_argument("--led-brightness", type=float, default=None,
+                   help="global LED brightness, 0..1 (overrides the saved "
+                        "profile for this run)")
+    p.add_argument("--led-profile", default=None, metavar="PATH",
+                   help="where the LED profile -- color scheme, reactivity, "
+                        "brightness, strip mapping -- is loaded from and "
+                        "saved to (default: led_profile.json next to run.py). "
+                        "Tune it live with l in the window.")
     args = p.parse_args()
 
     if args.list_devices:
@@ -145,13 +172,27 @@ def main():
         list_devices()
         return
 
-    # Register scenes here. Order = the number keys 1..9 in the window.
-    scenes = [PulseScene(), BarsScene(), LightningScene(), CymaticsScene(),
-              SpectrumScene(), NebulaScene(), ConstellationScene()]
-    App(build_source(args), scenes, now_playing=build_now_playing(args),
-        led_sink=build_led_sink(args), scale=args.scale,
-        fullscreen=args.fullscreen, display=args.display,
-        canvas=parse_canvas(args.canvas), supersample=args.supersample).run()
+    # --source loopback only works with a Multi-Output-style device selected,
+    # so it opts in by default; any other source leaves the output alone.
+    switcher = build_output_switcher(args)
+
+    # Register scenes here. Order = the number keys 1..9 in the window, and
+    # nine is all the keys there are -- so BarsScene, NebulaScene and
+    # LightningScene were retired from this list when the 3D family arrived.
+    # They are still defined in scenes.py: to put one back, import it above
+    # and swap it in for whichever of these you want the key for instead.
+    scenes = [PulseScene(), SpectrumScene(), CymaticsScene(),
+              ConstellationScene(), ChasmScene(), VortexScene(),
+              ResonanceScene(), CartographScene(), LatticeScene()]
+    try:
+        App(build_source(args), scenes, now_playing=build_now_playing(args),
+            led_sink=build_led_sink(args), scale=args.scale,
+            fullscreen=args.fullscreen, display=args.display,
+            canvas=parse_canvas(args.canvas),
+            supersample=args.supersample).run()
+    finally:
+        if switcher is not None:
+            switcher.restore()
 
 
 if __name__ == "__main__":

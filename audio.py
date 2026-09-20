@@ -16,9 +16,14 @@ sounddevice/soundfile are imported lazily so RestingSource runs even if you
 haven't installed the audio libs yet.
 """
 
+import os
+import sys
+
 import numpy as np
 
-from features import Features, FeatureExtractor
+from features import N_SPECTRUM_BINS, Features, FeatureExtractor
+
+AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AudioFiles")
 
 DEFAULT_SR = 44100
 BLOCK = 2048  # frames/callback; bigger = more slack for the audio thread to
@@ -63,13 +68,19 @@ class RestingSource:
         treble = 0.5 + 0.40 * np.sin(t * 1.70 + 2.6)
         rms = 0.40 + 0.30 * np.sin(t * 0.50)
         centroid = 0.5 + 0.40 * np.sin(t * 0.23)
-        # 6 incommensurate LFOs, phase-staggered, so the spectrum scene sees
-        # a wandering shape rather than 6 bars breathing in lockstep
-        bands = tuple(
-            float(np.clip(0.5 + 0.42 * np.sin(t * f + p), 0.0, 1.0))
-            for f, p in ((0.55, 0.0), (0.81, 1.1), (1.05, 2.3),
-                         (1.34, 0.4), (1.62, 3.0), (1.93, 1.7))
-        )
+        # The spectrum, as two incommensurate waves travelling along the bin
+        # axis at different speeds. Neighbouring bins stay correlated, which
+        # is the thing that makes this read as a spectrum rather than as
+        # noise -- real music has smooth neighbours. The count comes from
+        # N_SPECTRUM_BINS rather than a literal: resting mode has to hand
+        # scenes the same shape live audio does, or a bar scene silently
+        # changes resolution depending on the source.
+        i = np.arange(N_SPECTRUM_BINS) / max(1, N_SPECTRUM_BINS - 1)
+        bands = tuple(np.clip(
+            0.46 + 0.26 * np.sin(t * 0.70 + i * 6.1)
+                 + 0.16 * np.sin(t * 1.13 - i * 10.7 + 2.3)
+                 - 0.18 * i,                      # the roll-off real music has
+            0.02, 1.0).astype(float))
 
         beat = False
         if t >= self._next_beat:
@@ -130,6 +141,18 @@ class LiveAudioSource:
 
     def read(self, dt):
         return self.extractor.read(dt)
+
+
+def resolve_wav(path):
+    """Accept a bare filename (looked up in AudioFiles/) or a full/relative
+    path as-is, so `--wav song.wav` just works if it's dropped in AudioFiles/
+    without needing the full path spelled out every time."""
+    if os.path.isfile(path):
+        return path
+    candidate = os.path.join(AUDIO_DIR, path)
+    if os.path.isfile(candidate):
+        return candidate
+    sys.exit(f"--wav {path!r} not found (looked in cwd and {AUDIO_DIR})")
 
 
 class WavSource:

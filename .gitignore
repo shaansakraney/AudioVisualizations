@@ -15,3 +15,9 @@ AudioFiles/
 *.mp3
 *.flac
 *.aud
+
+# Your tuned LED profile -- per-installation, like AudioFiles/
+led_profile.json
+
+# ESP32 WiFi credentials -- copy wifi_secrets.example.h beside the sketch
+wifi_secrets.h

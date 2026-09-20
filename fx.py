@@ -14,6 +14,13 @@ re-deriving. Five pieces:
                                                                "electric" motif
 - field_grid / draw_field                                  -- Cymatics today;
                                                                Plasma later
+- PointCloud / SpectrumHistory / perspective               -- the whole 3D
+                                                               family:
+                                                               Constellation,
+                                                               Chasm, Vortex,
+                                                               Resonance,
+                                                               Cartograph,
+                                                               Lattice
 - palette_from_surface / circle_masked / blurred_backdrop  -- album art in
                                                                Pulse+Spectrum;
                                                                any image-driven
@@ -282,8 +289,10 @@ def field_grid(w, h):
     return _grid_cache[key]
 
 
-def _hsv_array_to_rgb(h, s, v):
-    """Vectorized HSV->RGB (h, s, v arrays in 0..1) -> uint8 (H, W, 3)."""
+def hsv_array(h, s, v):
+    """Vectorized HSV->RGB (h, s, v arrays in 0..1) -> uint8 (..., 3). The
+    array counterpart of hsv(); any shape works, so it colorizes a 2-D field
+    for the canvas and a 1-D strip of LED pixels with the same code."""
     i = (np.floor(h * 6.0).astype(np.int32)) % 6
     f = h * 6.0 - np.floor(h * 6.0)
     p = v * (1.0 - s)
@@ -299,10 +308,11 @@ def _hsv_array_to_rgb(h, s, v):
     return np.clip(rgb * 255, 0, 255).astype(np.uint8)
 
 
-def _rgb_array_to_hsv(rgb):
+def rgb_array_to_hsv(rgb):
     """Vectorized RGB->HSV. `rgb` is (..., 3) in 0..1; returns h, s, v arrays
-    each shaped like rgb[..., 0]. Counterpart to _hsv_array_to_rgb below --
-    used by palette_from_surface to score colors by vividness."""
+    each shaped like rgb[..., 0]. Counterpart to hsv_array above --
+    used by palette_from_surface to score colors by vividness, and by the LED
+    profile's saturation/hue knobs."""
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     mx = np.max(rgb, axis=-1)
     mn = np.min(rgb, axis=-1)
@@ -353,7 +363,7 @@ def draw_field(dst_surface, res, field_fn, sat=0.8):
     sat_arr = (np.clip(sat, 0.0, 1.0).astype(np.float32)
                if isinstance(sat, np.ndarray)
                else np.full_like(hue, float(np.clip(sat, 0.0, 1.0)), dtype=np.float32))
-    rgb = _hsv_array_to_rgb(np.mod(hue, 1.0), sat_arr, np.clip(value, 0.0, 1.0))
+    rgb = hsv_array(np.mod(hue, 1.0), sat_arr, np.clip(value, 0.0, 1.0))
     field_surf = pygame.surfarray.make_surface(rgb.transpose(1, 0, 2))
     scaled = pygame.transform.smoothscale(field_surf, dst_surface.get_size())
     dst_surface.blit(scaled, (0, 0))
@@ -385,7 +395,7 @@ def palette_from_surface(surface, n=6, sample=64, min_dist=0.12):
     small = pygame.transform.smoothscale(surface, (sample, sample))
     px = pygame.surfarray.array3d(small).reshape(-1, 3).astype(np.float32) / 255.0
 
-    h, s, v = _rgb_array_to_hsv(px)
+    h, s, v = rgb_array_to_hsv(px)
     # Filter on saturation, NOT on a value ceiling: a fully-saturated color
     # like pure orange has v == 1.0 (its red channel is maxed), so a
     # `v < 0.97` "drop near-white" test would throw away exactly the vivid
@@ -412,7 +422,7 @@ def palette_from_surface(surface, n=6, sample=64, min_dist=0.12):
                 centers[k] = pts[m].mean(axis=0)
 
     counts = np.array([(labels == k).sum() for k in range(n)], dtype=np.float32)
-    _, cs, cv = _rgb_array_to_hsv(centers)
+    _, cs, cv = rgb_array_to_hsv(centers)
     score = (counts / max(1.0, counts.sum())) * (0.35 + cs * cv)
     ranked = centers[np.argsort(-score)]
 
@@ -435,7 +445,7 @@ def most_vivid(palette, fallback=(255, 255, 255)):
     if not palette:
         return fallback
     arr = np.array(palette, dtype=np.float32).reshape(-1, 3) / 255.0
-    _, s, v = _rgb_array_to_hsv(arr)
+    _, s, v = rgb_array_to_hsv(arr)
     return tuple(int(c) for c in palette[int(np.argmax(s * v))])
 
 
@@ -490,3 +500,201 @@ def blurred_backdrop(cache, key, art, size, darken=195, downscale=14):
 
     cache[key] = ((size, darken), out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# 3D point clouds
+# ---------------------------------------------------------------------------
+
+def perspective(z, focal, depth):
+    """Perspective shrink factor for a point at normalized depth `z` (0 =
+    right in front of the camera, 1 = the back of the scene). Smaller `focal`
+    = wider lens = more dramatic convergence; `depth` is how far back z=1
+    actually sits. Everything in a 3D scene -- x/y position, dot size, and
+    brightness -- is this one number times its flat value."""
+    return focal / (focal + z * depth)
+
+
+def depth_tail(n, power=3.0):
+    """Row weights that fade the furthest rows out entirely, so a point cloud
+    dissolves at the horizon instead of ending on a hard back wall."""
+    return 1.0 - (np.arange(n, dtype=np.float32) / n) ** power
+
+
+class SpectrumHistory:
+    """A scrolling buffer of the last N spectra -- the shared substrate of
+    every "Z is time" scene.
+
+    `push(bands, dt)` interpolates the coarse `f.bands` up to `n_cols` columns
+    (so a ridge line is a curve, not a staircase) and pushes it onto the front
+    at a fixed `hz` regardless of frame rate. The leftover fraction is kept in
+    `.acc` and handed to the projection as a sub-row offset, which is what
+    makes the field drift continuously rather than stepping once per push.
+    `.rows` is (n_rows, n_cols), row 0 = now.
+    """
+
+    def __init__(self, n_cols, n_rows, hz=20.0):
+        self.n_cols = n_cols
+        self.n_rows = n_rows
+        self.hz = hz
+        self.rows = np.zeros((n_rows, n_cols), dtype=np.float32)
+        self.acc = 0.0
+        self._dst = np.linspace(0.0, 1.0, n_cols, dtype=np.float32)
+        self._src = np.linspace(0.0, 1.0, 1, dtype=np.float32)
+
+    def push(self, bands, dt):
+        bands = np.asarray(bands, dtype=np.float32)
+        if len(self._src) != len(bands):
+            self._src = np.linspace(0.0, 1.0, len(bands), dtype=np.float32)
+        row = np.interp(self._dst, self._src, bands).astype(np.float32)
+
+        self.acc += dt * self.hz
+        while self.acc >= 1.0:
+            self.acc -= 1.0
+            self.rows = np.roll(self.rows, 1, axis=0)
+            self.rows[0] = row
+        self.rows[0] = row   # keep the front row live between pushes
+        return row
+
+
+class PointCloud:
+    """Renders a few thousand 3D-projected points as soft additive dots.
+
+    `splat()` takes normalized screen coordinates, a per-point Gaussian radius
+    and a per-point color, scatters them all into one float buffer (so overlaps
+    bloom rather than occlude), then adds a blurred copy of that buffer back on
+    top for glow. There is no per-point pygame call anywhere -- which is what
+    makes ~6000 points affordable at 60fps.
+
+    Scenes differ only in how they compute px/py/sigma/rgb; this class is the
+    renderer they share. Every "Z is time / Z is depth" scene in scenes.py goes
+    through one of these.
+
+    Four things make it affordable and are easy to undo by accident:
+      * the whole kernel goes through ONE scatter over a (taps, N) block
+        rather than one call per tap (~4x);
+      * that scatter is np.bincount, not np.add.at (~2.7x);
+      * `px - xi.astype(np.float32)` is deliberate -- float32 minus int32
+        promotes to float64 under numpy's rules and silently makes every array
+        downstream double-width (~5x);
+      * the glow gain is a BLEND_MULT fill on the *small* blurred surface; the
+        same fill at 1920x1080 costs ~7ms all by itself.
+    The Gaussian is PEAK-normalized, not area-normalized: area normalization
+    spreads a near dot's light thinner the bigger it gets and washes the front
+    rows out.
+    """
+
+    def __init__(self, max_px=1_050_000, kernel_r=3):
+        # Pixel budget for the float buffer. The buffer is the canvas size or
+        # this, whichever is smaller, so at 1080p there is no upscale at all
+        # and a far-away point stays a single crisp pixel. Expressed as a count
+        # rather than a divisor so frame time stays flat as the canvas grows.
+        self.max_px = max_px
+        # How many taps per side the splat writes. (2R+1)^2 taps per point is
+        # the real cost dial, and it has to comfortably exceed the largest
+        # sigma passed in or near dots get clipped square.
+        self.kernel_r = kernel_r
+        self._scratch = {}
+
+        r = kernel_r
+        o = np.arange(-r, r + 1, dtype=np.float32)
+        ox, oy = np.meshgrid(o, o, indexing="xy")
+        self._kox, self._koy = ox.ravel(), oy.ravel()
+        self._koxi = self._kox.astype(np.int32)[:, None]
+        self._koyi = self._koy.astype(np.int32)[:, None]
+
+    def buffer_size(self, surface):
+        """The (w, h) the point buffer will actually be for this surface --
+        callers that want sigma in canvas pixels can scale by it."""
+        W, H = surface.get_size()
+        div = max(1, int(np.ceil(np.sqrt(W * H / float(self.max_px)))))
+        return max(4, W // div), max(4, H // div)
+
+    def _surf(self, key, size):
+        """Persistent opaque scratch surface. Unlike fx.scratch_surface this
+        deliberately does NOT clear -- every use below smoothscales over the
+        whole thing, and clearing a full-canvas surface per frame is exactly
+        the kind of cost that competes with the audio thread."""
+        s = self._scratch.get(key)
+        if s is None or s.get_size() != size:
+            s = pygame.Surface(size)
+            self._scratch[key] = s
+        return s
+
+    def splat(self, surface, px, py, sigma, rgb, ambient=0.0,
+              glow=1.3, glow_downscale=10):
+        """Draw the cloud onto `surface`.
+
+        px, py   normalized 0..1 screen coords (any shape; raveled)
+        sigma    Gaussian radius in BUFFER pixels; scalar or per-point
+        rgb      (N, 3) floats 0..1, already multiplied by each point's
+                 intensity -- brightness lives in the color, not a separate
+                 alpha, because the accumulation is additive
+        ambient  constant added to every pixel; scalar or (3,). A faint wash in
+                 the palette's own color so empty space never sits at dead
+                 black. It is added into the buffer rather than blitted over
+                 the canvas because the equivalent full-canvas BLEND_ADD fill
+                 costs ~7ms at 1080p -- and note the glow pass then blurs and
+                 re-adds it, so what lands on screen is about (1 + glow)x this.
+        glow     bloom gain; 0 skips the pass. Above 1.0 it is applied as
+                 repeated additive blits, so it can push well past a single
+                 pass without clipping the core dots.
+        """
+        W, H = surface.get_size()
+        rw, rh = self.buffer_size(surface)
+
+        px = np.asarray(px, dtype=np.float32).ravel() * rw
+        py = np.asarray(py, dtype=np.float32).ravel() * rh
+        n = px.size
+        sig = np.broadcast_to(
+            np.asarray(sigma, dtype=np.float32).ravel(), (n,))
+        sig = np.maximum(0.45, sig)
+        rgb = np.asarray(rgb, dtype=np.float32).reshape(-1, 3)
+
+        xi = np.floor(px).astype(np.int32)
+        yi = np.floor(py).astype(np.int32)
+        fxp = (px - xi.astype(np.float32))[None, :]
+        fyp = (py - yi.astype(np.float32))[None, :]
+
+        dx = self._kox[:, None] - fxp                            # (taps,N)
+        dy = self._koy[:, None] - fyp
+        inv = (0.5 / (sig * sig))[None, :]
+        wts = np.exp(-(dx * dx + dy * dy) * inv)
+
+        # Taps that land outside the buffer are zeroed, not clamped. Clamping
+        # them (the obvious thing) smears every off-canvas point onto the
+        # nearest edge pixel, which shows up as a bright band along the border
+        # of any scene whose geometry runs past the canvas.
+        gx = xi[None, :] + self._koxi
+        gy = yi[None, :] + self._koyi
+        wts *= ((gx >= 0) & (gx < rw) & (gy >= 0) & (gy < rh))
+        idx = (np.clip(gy, 0, rh - 1) * rw + np.clip(gx, 0, rw - 1)).ravel()
+
+        npix = rw * rh
+        buf = np.empty((npix, 3), dtype=np.float32)
+        for c in range(3):
+            buf[:, c] = np.bincount(idx, weights=(wts * rgb[None, :, c]).ravel(),
+                                    minlength=npix)
+
+        buf += np.asarray(ambient, dtype=np.float32)
+        np.clip(buf, 0.0, 1.0, out=buf)
+        out = (buf.reshape(rh, rw, 3) * 255.0).astype(np.uint8)
+        small = pygame.surfarray.make_surface(out.transpose(1, 0, 2))
+        if (rw, rh) == (W, H):
+            surface.blit(small, (0, 0))
+        else:
+            pygame.transform.smoothscale(small, (W, H), surface)
+
+        if glow > 0.0:
+            bw = max(2, rw // glow_downscale)
+            bh = max(2, rh // glow_downscale)
+            blur = self._surf("blur", (bw, bh))
+            pygame.transform.smoothscale(small, (bw, bh), blur)
+            passes = max(1, int(np.ceil(glow)))
+            k = int(round(255 * glow / passes))
+            if k < 255:
+                blur.fill((k, k, k), special_flags=pygame.BLEND_MULT)
+            g = self._surf("glow", (W, H))
+            pygame.transform.smoothscale(blur, (W, H), g)
+            for _ in range(passes):
+                surface.blit(g, (0, 0), special_flags=pygame.BLEND_ADD)
